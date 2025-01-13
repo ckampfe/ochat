@@ -2,6 +2,7 @@
 // - [ ] ability to "branch" from a certain portion of the conversation, by
 //       creating a new conversation up to a certain point
 // - [ ] auto reload in dev
+// - [x] log level via RUST_LOG
 // - [x] request logging (with tower)
 // - [ ] search
 // - [ ] tagging
@@ -610,7 +611,7 @@ struct Config {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let config = Config::parse();
