@@ -2,9 +2,11 @@
 // - [ ] ability to "branch" from a certain portion of the conversation, by
 //       creating a new conversation up to a certain point
 // - [ ] auto reload in dev
-// - [ ] request logging (with tower)
+// - [x] request logging (with tower)
 // - [ ] search
 // - [ ] tagging
+// - [x] config
+// - [x] state debugging endpoint
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -12,12 +14,14 @@ use axum::response::sse::Event;
 use axum::response::Sse;
 use axum::routing::{get, post};
 use axum::{Form, Router};
+use clap::Parser;
 use futures::Stream;
 use maud::{html, Markup, DOCTYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, Sqlite};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,11 +48,6 @@ async fn send_chat_message(
     let rx2 = tx.subscribe();
 
     history.push(message.clone());
-
-    // let mut prompt = history
-    //     .iter()
-    //     .map(|message| format!("{}: {}\n", message.who, message.body))
-    //     .collect::<String>();
 
     let mut prompt = String::new();
 
@@ -81,7 +80,7 @@ async fn send_chat_message(
     Ok((rx1, rx2))
 }
 
-#[derive(Clone, sqlx::FromRow)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 struct Message {
     id: i64,
     body: String,
@@ -332,7 +331,6 @@ async fn conversations_show(
                         }
 
                         input type="hidden" name="conversation_id" value=(conversation.id) {}
-                        // button type="submit" { "Send" }
                         div class="field is-grouped" {
                             div class="control" {
                                 button class="button is-link" {
@@ -379,7 +377,7 @@ async fn messages_create(
         inserted_at,
         updated_at;",
     )
-    .bind("Me")
+    .bind(Who::Me)
     .bind(message_send_form.body)
     .bind(message_send_form.conversation_id)
     .fetch_one(&mut *conn)
@@ -450,7 +448,7 @@ async fn messages_create(
          returning *;
          ",
         )
-        .bind("LlaMA")
+        .bind(Who::Llama)
         .bind(response)
         .bind(conversation_id)
         .fetch_one(&mut *conn)
@@ -465,7 +463,7 @@ async fn messages_create(
     Ok(html! {
             @if let Some(m) = previous_llama_sse_response {
                 template {
-                    tr hx-swap-oob="outerHTML:#previous-llama-sse-response" {
+                    tr hx-swap-oob="outerHTML:tr#previous-llama-sse-response" {
                         td {
                             (count - 1)
                         }
@@ -507,7 +505,7 @@ async fn messages_create(
                     ""
                 }
                 td {
-                    "LlaMA"
+                    (Who::Llama)
                 }
                 td {
                     pre
@@ -578,6 +576,7 @@ async fn conversations_create(
     Ok(headers)
 }
 
+#[derive(Debug)]
 struct AppState {
     pool: sqlx::Pool<Sqlite>,
     history: Vec<Message>,
@@ -585,36 +584,37 @@ struct AppState {
     ollama_rx: Option<tokio::sync::broadcast::Receiver<ChatChunk>>,
 }
 
-// #[derive(Clone, sqlx::Type, Deserialize, Serialize)]
-// #[sqlx(type_name = "Who")]
-// enum Who {
-//     Me,
-//     Llama,
-// }
+#[derive(Clone, sqlx::Type, Deserialize, Serialize)]
+enum Who {
+    #[sqlx(rename = "Me")]
+    Me,
+    #[sqlx(rename = "LlaMA")]
+    Llama,
+}
 
-// impl Display for Who {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match self {
-//             Who::Me => write!(f, "Me"),
-//             Who::Llama => write!(f, "LlaMA"),
-//         }
-//     }
-// }
+impl Display for Who {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Who::Me => write!(f, "Me"),
+            Who::Llama => write!(f, "LlaMA"),
+        }
+    }
+}
 
-// impl FromStr for Who {
-//     type Err = &'static str;
-
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         match s {
-//             "Me" => Ok(Who::Me),
-//             "LlaMA" => Ok(Who::Llama),
-//             _ => Err("must be Me or LlaMA"),
-//         }
-//     }
-// }
+#[derive(Debug, Parser)]
+struct Config {
+    #[arg(long, env, default_value = "3000")]
+    port: u16,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
+    let config = Config::parse();
+
     let opts = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite://conversations.db")?
         .busy_timeout(std::time::Duration::from_secs(5))
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
@@ -669,9 +669,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
-        .with_state(state);
+        .route(
+            "/dev/state",
+            get(|State(state): State<Arc<Mutex<AppState>>>| async move {
+                let state = state.lock().await;
+                format!("{:#?}", state)
+            }),
+        )
+        .with_state(state)
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
