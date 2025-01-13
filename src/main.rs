@@ -1,13 +1,15 @@
 // TODO:
-// - [ ] ability to "branch" from a certain portion of the conversation, by
+// - [x] ability to "fork"/"branch" from a certain portion of the conversation, by
 //       creating a new conversation up to a certain point
 // - [ ] auto reload in dev
 // - [x] log level via RUST_LOG
 // - [x] request logging (with tower)
-// - [ ] search
-// - [ ] tagging
+// - [ ] message search
+// - [ ] conversation tagging
 // - [x] config
 // - [x] state debugging endpoint
+// - [ ] back button on `show`
+// - [ ] rename conversations
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -30,8 +32,8 @@ use tokio_stream::StreamExt;
 
 #[derive(Deserialize, Clone, Debug)]
 struct ChatChunk {
-    model: String,
-    created_at: String,
+    // model: String,
+    // created_at: String,
     response: String,
     done: bool,
 }
@@ -95,6 +97,8 @@ struct Message {
 struct Conversation {
     id: i64,
     name: String,
+    source_conversation_id: Option<i64>,
+    source_conversation_name: Option<String>,
     inserted_at: String,
     updated_at: String,
 }
@@ -103,6 +107,8 @@ struct Conversation {
 struct ConversationWithLastMessageTime {
     id: i64,
     name: String,
+    source_conversation_id: Option<i64>,
+    source_conversation_name: Option<String>,
     inserted_at: String,
     updated_at: String,
     last_message_inserted_at: String,
@@ -120,6 +126,8 @@ async fn conversations_index(
         select
             conversations.id,
             conversations.name,
+            c2.name as source_conversation_name,
+            c2.id as source_conversation_id,
             conversations.inserted_at,
             conversations.updated_at,
             last_messages.last_message_inserted_at
@@ -132,7 +140,9 @@ async fn conversations_index(
             group by conversation_id
         ) last_messages
             on last_messages.conversation_id = conversations.id
-        order by inserted_at desc;
+        left join conversations c2
+            on conversations.source_conversation_id = c2.id
+        order by conversations.inserted_at desc;
         ",
     )
     .fetch_all(&mut *conn)
@@ -161,41 +171,57 @@ async fn conversations_index(
         }
         body {
             div class="container mb-5" {
-            h1 {
-                "conversations"
-            }
+                nav class="level" {
+                    div class="level-left" {
+                        div class="level-item" {
+                            h2 class="subtitle" {
+                                "conversations"
+                            }
+                        }
 
-            button hx-post="/conversations/new" {
-                "new conversation"
-            }
-            table class="table" {
-                thead {
-                    tr {
-                        th { "started" }
-                        th { "last message" }
-                        th { "name" }
+                        div class="level-item" {
+                            a hx-post="/conversations/new" {
+                                "new conversation"
+                            }
+                        }
                     }
                 }
-
-                @for conversation in conversations {
-                    tbody {
+                table class="table" {
+                    thead {
                         tr {
-                            td {
-                                (conversation.inserted_at)
-                            }
-                            td {
-                                (conversation.last_message_inserted_at)
-                            }
-                            td {
-                                a href=(format!("/conversations/{}", conversation.id)) {
-                                    (conversation.name)
+                            th { "started" }
+                            th { "last message" }
+                            th { "name" }
+                            th { "source" }
+                        }
+                    }
+
+                    @for conversation in conversations {
+                        tbody {
+                            tr {
+                                td {
+                                    (conversation.inserted_at)
+                                }
+                                td {
+                                    (conversation.last_message_inserted_at)
+                                }
+                                td {
+                                    a href=(format!("/conversations/{}", conversation.id)) {
+                                        (conversation.name)
+                                    }
+                                }
+                                @if let Some(source_conversation_name) = conversation.source_conversation_name {
+                                    td {
+                                        a href=(format!("/conversations/{}", conversation.source_conversation_id.unwrap())) {
+                                            (source_conversation_name)
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
         }
     })
 }
@@ -208,11 +234,25 @@ async fn conversations_show(
 
     let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
 
-    let conversation: Conversation = sqlx::query_as("select * from conversations where id = ?;")
-        .bind(conversation_id)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
+    let conversation: Conversation = sqlx::query_as(
+        "
+    select
+        conversations.id,
+        conversations.name,
+        conversations.source_conversation_id,
+        c2.name as source_conversation_name,
+        conversations.inserted_at,
+        conversations.updated_at
+    from conversations
+    left join conversations c2
+        on conversations.source_conversation_id = c2.id
+    where conversations.id = ?;
+    ",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
 
     let messages: Vec<Message> = sqlx::query_as(
         "
@@ -278,11 +318,22 @@ async fn conversations_show(
                             "Last message at: " (last_message.inserted_at)
                         }
                     }
+                    @if let Some(source_conversation_name) = conversation.source_conversation_name {
+                        h2 class="subtitle" {
+                            "Source: "
+                            a href=(format!("/conversations/{}", conversation.source_conversation_id.unwrap())) {
+                                (source_conversation_name)
+                            }
+                        }
+                    }
                 }
 
                 table class="table" {
                     thead {
                         tr {
+                            th {
+                                ""
+                            }
                             th {
                                 ""
                             }
@@ -312,6 +363,11 @@ async fn conversations_show(
                                 td {
                                     pre {
                                         (message.body)
+                                    }
+                                }
+                                td {
+                                    a hx-post=(format!("/conversations/{}/fork/{}", conversation.id, message.id)) {
+                                        "Fork"
                                     }
                                 }
                             }
@@ -479,6 +535,11 @@ async fn messages_create(
                                 (m.body)
                             }
                         }
+                        td {
+                            a hx-post=(format!("/conversations/{}/fork/{}", m.conversation_id, m.id)) {
+                                "Fork"
+                            }
+                        }
                     }
                 }
             }
@@ -495,6 +556,11 @@ async fn messages_create(
                 td {
                     pre {
                         (message.body)
+                    }
+                }
+                td {
+                    a hx-post=(format!("/conversations/{}/fork/{}", message.conversation_id, message.id)) {
+                        "Fork"
                     }
                 }
             }
@@ -518,6 +584,9 @@ async fn messages_create(
                     {
                         ""
                     }
+                }
+                td {
+                    // Can't fork yet...need the message id once it's actually inserted
                 }
             }
     })
@@ -567,6 +636,71 @@ async fn conversations_create(
     let conversation_id = conversation_id.0;
 
     let path = format!("/conversations/{conversation_id}");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "HX-Redirect",
+        HeaderValue::try_from(path).map_err(|e| e.to_string())?,
+    );
+
+    Ok(headers)
+}
+
+async fn conversations_fork_create(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Path((conversation_id, message_id)): Path<(i64, i64)>,
+) -> axum::response::Result<HeaderMap> {
+    let state = state.lock().await;
+    let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
+
+    let (new_conversation_id,): (i64,) = sqlx::query_as(
+        "
+        insert into conversations (name, source_conversation_id)
+        values ('a new conversation', ?)
+        returning id;",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let latest_message: Message = sqlx::query_as(
+        "
+    select
+        *
+    from messages
+    where id = ?
+    limit 1;
+    ",
+    )
+    .bind(message_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "
+    insert into messages (who, body, conversation_id)
+    select
+        who,
+        body,
+        ?
+    from messages
+    where conversation_id = ?
+    and inserted_at <= ?;
+    ",
+    )
+    .bind(new_conversation_id)
+    .bind(conversation_id)
+    .bind(latest_message.inserted_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    let path = format!("/conversations/{new_conversation_id}");
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -632,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
         "create table if not exists conversations (
             id integer primary key autoincrement not null,
             name text not null,
+            source_conversation_id integer,
             inserted_at datetime not null default current_timestamp,
             updated_at datetime not null default current_timestamp
         )",
@@ -667,6 +802,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(conversations_index))
         .route("/conversations/", get(conversations_index))
         .route("/conversations/{id}", get(conversations_show))
+        .route(
+            "/conversations/{conversation_id}/fork/{message_id}",
+            post(conversations_fork_create),
+        )
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
