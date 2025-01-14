@@ -7,15 +7,20 @@
 // - [ ] message search
 // - [ ] conversation tagging
 // - [x] config
+// - [x] make database file configurable
 // - [x] state debugging endpoint
 // - [ ] back button on `show`
-// - [ ] rename conversations
+// - [x] edit conversation names
+// - [ ] delete messages
+// - [ ] delete conversations
+// - [ ] cmd+enter to send messages
+// - [ ] fix Option::take panic
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::Event;
 use axum::response::Sse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Form, Router};
 use clap::Parser;
 use futures::Stream;
@@ -297,14 +302,24 @@ async fn conversations_show(
             div class="container mb-5" {
                 section class="section" {
                     div class="level" {
-                        div class="level-left" {
+                        div
+                            id="conversation-name-block"
+                            class="level-left"
+                        {
                             div class="level-item" {
                                 h1 class="title" {
                                     (conversation.name)
                                 }
                             }
-                            div class="level-item" {
-                                a href="" {
+                            div
+                                id="conversation-name-edit"
+                                class="level-item"
+                            {
+                                a
+                                    hx-get=(format!("/conversations/{}/edit", conversation.id))
+                                    hx-swap="outerHTML"
+                                    hx-target="#conversation-name-edit"
+                                {
                                     "Edit"
                                 }
                             }
@@ -688,12 +703,14 @@ async fn conversations_fork_create(
         ?
     from messages
     where conversation_id = ?
-    and inserted_at <= ?;
+    and messages.inserted_at <= ?
+    and messages.id <= ?
     ",
     )
     .bind(new_conversation_id)
-    .bind(conversation_id)
+    .bind(latest_message.conversation_id)
     .bind(latest_message.inserted_at)
+    .bind(message_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
@@ -709,6 +726,116 @@ async fn conversations_fork_create(
     );
 
     Ok(headers)
+}
+
+#[derive(Deserialize)]
+struct ConversationNameChangeForm {
+    conversation_name: String,
+}
+
+async fn conversations_edit_get(
+    Path(conversation_id): Path<i64>,
+) -> axum::response::Result<Markup> {
+    Ok(html! {
+        div
+            id="conversation-name-edit"
+            class="level-item"
+        {
+            form
+                hx-put=(format!("/conversations/{conversation_id}/edit"))
+                hx-target="#conversation-name-block"
+                hx-swap="outerHTML"
+            {
+                div class="field is-horizontal" {
+                    div class="field-body" {
+                        div class="field" {
+                            div class="control" {
+                                input type="text" name="conversation_name" class="input" placeholder="Conversation name" required;
+                            }
+                        }
+                        div class="field" {
+                            p class="control" {
+                                button class="button is-link" {
+                                    "Submit"
+                                }
+                            }
+                        }
+                        div class="field" {
+                            p class="control" {
+                                button
+                                    hx-get=(format!("/conversations/{}/edit/cancel", conversation_id))
+                                    hx-target="#conversation-name-edit"
+                                    hx-swap="outerHTML"
+                                    class="button is-link"
+                                {
+                                    "Cancel"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn conversations_edit_save(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Path(conversation_id): Path<i64>,
+    Form(name_change_form): Form<ConversationNameChangeForm>,
+) -> axum::response::Result<Markup> {
+    let state = state.lock().await;
+    let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "
+    update conversations
+    set name = ?
+    where id = ?",
+    )
+    .bind(&name_change_form.conversation_name)
+    .bind(conversation_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(html! {
+        div
+            id="conversation-name-block"
+            class="level-left"
+        {
+            div class="level-item" {
+                h1 class="title" {
+                    (name_change_form.conversation_name)
+                }
+            }
+            div class="level-item" {
+                a hx-get=(format!("/conversations/{}/edit", conversation_id)) {
+                    "Edit"
+                }
+            }
+        }
+    })
+}
+
+async fn conversations_edit_cancel(
+    State(_state): State<Arc<Mutex<AppState>>>,
+    Path(conversation_id): Path<i64>,
+) -> axum::response::Result<Markup> {
+    Ok(html! {
+        div
+            id="conversation-name-edit"
+            class="level-item"
+        {
+            a
+                hx-get=(format!("/conversations/{}/edit", conversation_id))
+                hx-swap="outerHTML"
+                hx-target="#conversation-name-edit"
+            {
+                "Edit"
+            }
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -738,6 +865,8 @@ impl Display for Who {
 
 #[derive(Debug, Parser)]
 struct Config {
+    #[arg(long, env, default_value = "conversations.db")]
+    database: String,
     #[arg(long, env, default_value = "3000")]
     port: u16,
 }
@@ -750,11 +879,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
 
-    let opts = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite://conversations.db")?
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .create_if_missing(true)
-        .foreign_keys(true);
+    let opts =
+        sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", config.database))?
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .create_if_missing(true)
+            .foreign_keys(true);
 
     let pool = sqlx::SqlitePool::connect_with(opts).await?;
 
@@ -767,8 +897,8 @@ async fn main() -> anyhow::Result<()> {
             id integer primary key autoincrement not null,
             name text not null,
             source_conversation_id integer,
-            inserted_at datetime not null default current_timestamp,
-            updated_at datetime not null default current_timestamp
+            inserted_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+            updated_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
         )",
     )
     .execute(&mut *txn)
@@ -780,8 +910,8 @@ async fn main() -> anyhow::Result<()> {
             body text not null,
             who text not null,
             conversation_id integer not null,
-            inserted_at datetime not null default current_timestamp,
-            updated_at datetime not null default current_timestamp,
+            inserted_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+            updated_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
 
             foreign key(conversation_id) references conversations(id)
         )",
@@ -802,6 +932,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(conversations_index))
         .route("/conversations/", get(conversations_index))
         .route("/conversations/{id}", get(conversations_show))
+        .route("/conversations/{id}/edit", get(conversations_edit_get))
+        .route("/conversations/{id}/edit", put(conversations_edit_save))
+        .route(
+            "/conversations/{id}/edit/cancel",
+            get(conversations_edit_cancel),
+        )
         .route(
             "/conversations/{conversation_id}/fork/{message_id}",
             post(conversations_fork_create),
