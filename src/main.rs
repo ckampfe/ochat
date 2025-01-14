@@ -12,7 +12,8 @@
 // - [ ] back button on `show`
 // - [x] edit conversation names
 // - [ ] delete messages
-// - [ ] delete conversations
+// - [x] delete conversations (show)
+// - [ ] bulk delete conversations (index)
 // - [ ] cmd+enter to send messages
 // - [ ] fix Option::take panic
 
@@ -20,7 +21,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::Event;
 use axum::response::Sse;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Form, Router};
 use clap::Parser;
 use futures::Stream;
@@ -340,6 +341,12 @@ async fn conversations_show(
                                 (source_conversation_name)
                             }
                         }
+                    }
+                    a
+                        hx-delete=(format!("/conversations/{}/delete", conversation.id))
+                        hx-confirm="Really delete? Conversation and all messages will be destroyed."
+                    {
+                        "Delete conversation"
                     }
                 }
 
@@ -838,6 +845,34 @@ async fn conversations_edit_cancel(
     })
 }
 
+async fn conversations_delete(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Path(conversation_id): Path<i64>,
+) -> axum::response::Result<HeaderMap> {
+    let state = state.lock().await;
+    let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "
+    delete from conversations
+    where id = ?;",
+    )
+    .bind(conversation_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let path = "/conversations/";
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "HX-Redirect",
+        HeaderValue::try_from(path).map_err(|e| e.to_string())?,
+    );
+
+    Ok(headers)
+}
+
 #[derive(Debug)]
 struct AppState {
     pool: sqlx::Pool<Sqlite>,
@@ -913,7 +948,7 @@ async fn main() -> anyhow::Result<()> {
             inserted_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
             updated_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
 
-            foreign key(conversation_id) references conversations(id)
+            foreign key(conversation_id) references conversations(id) on delete cascade
         )",
     )
     .execute(&mut *txn)
@@ -938,6 +973,7 @@ async fn main() -> anyhow::Result<()> {
             "/conversations/{id}/edit/cancel",
             get(conversations_edit_cancel),
         )
+        .route("/conversations/{id}/delete", delete(conversations_delete))
         .route(
             "/conversations/{conversation_id}/fork/{message_id}",
             post(conversations_fork_create),
