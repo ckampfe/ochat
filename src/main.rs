@@ -16,6 +16,9 @@
 // - [ ] bulk delete conversations (index)
 // - [ ] cmd+enter to send messages
 // - [ ] fix Option::take panic
+// - [ ] xdg spec for app data
+// - [ ] list available local models (curl http://localhost:11434/api/tags)
+// - [ ] selectable models per conversation
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
