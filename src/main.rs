@@ -9,7 +9,7 @@
 // - [x] config
 // - [x] make database file configurable
 // - [x] state debugging endpoint
-// - [ ] back button on `show`
+// - [x] back button on `show`
 // - [x] edit conversation names
 // - [ ] delete messages
 // - [x] delete conversations (show)
@@ -302,6 +302,9 @@ async fn conversations_show(
         body {
             div class="container mb-5" {
                 section class="section" {
+                    a href="/conversations/" {
+                        "Back"
+                    }
                     div class="level" {
                         div
                             id="conversation-name-block"
