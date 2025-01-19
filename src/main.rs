@@ -15,7 +15,7 @@
 // - [x] delete conversations (show)
 // - [ ] bulk delete conversations (index)
 // - [ ] cmd+enter to send messages
-// - [ ] fix Option::take panic
+// - [x] fix Option::take panic
 // - [ ] xdg spec for app data
 // - [ ] list available local models (curl http://localhost:11434/api/tags)
 // - [ ] selectable models per conversation
@@ -47,18 +47,18 @@ struct ChatChunk {
     done: bool,
 }
 
+#[derive(Clone)]
+enum OllamaResponseMessage {
+    More { response: String },
+    Done,
+}
+
 async fn send_chat_message(
     client: reqwest::Client,
     message: &Message,
+    ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
     history: &mut Vec<Message>,
-) -> anyhow::Result<(
-    tokio::sync::broadcast::Receiver<ChatChunk>,
-    tokio::sync::broadcast::Receiver<ChatChunk>,
-)> {
-    let (tx, rx1) = tokio::sync::broadcast::channel(10);
-
-    let rx2 = tx.subscribe();
-
+) -> anyhow::Result<()> {
     history.push(message.clone());
 
     let mut prompt = String::new();
@@ -70,8 +70,6 @@ async fn send_chat_message(
         prompt.push('\n');
     }
 
-    prompt.push_str("You:");
-
     let body = HashMap::from([("model", "llama3.3".to_string()), ("prompt", prompt)]);
 
     tokio::spawn(async move {
@@ -82,14 +80,22 @@ async fn send_chat_message(
             .await
             .unwrap();
 
+        // TODO we should be able to propagate some error response
+        // to the client here.
         while let Some(chunk) = resp.chunk().await.unwrap() {
-            if let Ok(chunk) = serde_json::from_slice(&chunk) {
-                let _ = tx.send(chunk);
+            if let Ok(chunk) = serde_json::from_slice::<ChatChunk>(&chunk) {
+                if chunk.done {
+                    let _ = ollama_tx.send(OllamaResponseMessage::Done);
+                } else {
+                    let _ = ollama_tx.send(OllamaResponseMessage::More {
+                        response: chunk.response,
+                    });
+                }
             };
         }
     });
 
-    Ok((rx1, rx2))
+    Ok(())
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -407,23 +413,30 @@ async fn conversations_show(
                         hx-post="/messages/new"
                         hx-target="#messages"
                         hx-swap="beforeend"
+                        // https://htmx.org/examples/keyboard-shortcuts/
+                        // hx-trigger="keyup[metaKey&&key=='Enter'], keyup[shiftKey&&key=='Enter'] from:body"
                         hx-on::after-request=" if(event.detail.successful) this.reset()"
                     {
                         div class="field" {
                             div class="control" {
-                                textarea class="textarea" name="body" {}
+                                textarea
+                                    class="textarea"
+                                    name="body" {}
                             }
                         }
 
                         input type="hidden" name="conversation_id" value=(conversation.id) {}
-                        div class="field is-grouped" {
-                            div class="control" {
-                                button class="button is-link" {
-                                    "Send"
+                        div class="field-body" {
+                            div class="field is-grouped" {
+                                div class="control" {
+                                    button
+                                        class="button is-link"
+                                    {
+                                        "Send"
+                                    }
                                 }
                             }
                         }
-
                     }
                 }
             }
@@ -469,7 +482,7 @@ async fn messages_create(
     .await
     .map_err(|e| e.to_string())?;
 
-    let count_row: (i64,) = sqlx::query_as(
+    let (count,): (i64,) = sqlx::query_as(
         "select
         count(*)
     from messages
@@ -481,50 +494,12 @@ async fn messages_create(
     .await
     .map_err(|e| e.to_string())?;
 
-    let count = count_row.0;
-
-    let previous_llama_sse_response: Option<Message> = sqlx::query_as(
-        "
-        select
-            *
-        from
-        messages
-        where conversation_id = ?
-        and who = 'LlaMA'
-        order by inserted_at desc
-        limit 1;",
-    )
-    .bind(message_send_form.conversation_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let client = state.http_client.clone();
-
-    let (ollama_rx1, ollama_rx2) = send_chat_message(client, &message, &mut state.history)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    state.ollama_rx = Some(ollama_rx1);
-
-    let conn2 = state.pool.acquire().await.map_err(|e| e.to_string())?;
-
     let conversation_id = message_send_form.conversation_id;
 
-    tokio::spawn(async move {
-        let state = state_for_response;
-        let conversation_id = conversation_id;
-        let mut conn = conn2;
-        let mut ollama_rx = ollama_rx2;
-
-        let mut response = String::new();
-
-        while let Ok(chat_chunk) = ollama_rx.recv().await {
-            response.push_str(&chat_chunk.response)
-        }
-
-        let message: Message = sqlx::query_as(
-            "
+    // create the reply from llama.
+    // initially, it's empty.
+    let current_llama_sse_response: Message = sqlx::query_as(
+        "
         insert into messages (
             who,
             body,
@@ -532,45 +507,75 @@ async fn messages_create(
         ) values (?, ?, ?)
          returning *;
          ",
+    )
+    .bind(Who::Llama)
+    .bind("")
+    .bind(conversation_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let client = state.http_client.clone();
+
+    let ollama_rx2 = state.ollama_rx.resubscribe();
+
+    let conn2 = state.pool.acquire().await.map_err(|e| e.to_string())?;
+
+    tokio::spawn(async move {
+        let state = state_for_response;
+        let mut conn = conn2;
+        let mut ollama_rx = ollama_rx2;
+
+        while let Ok(chat_chunk) = ollama_rx.recv().await {
+            match chat_chunk {
+                OllamaResponseMessage::More { response } => {
+                    sqlx::query(
+                        "
+                        update messages
+                        set body = body || ?
+                         where id = ?
+                         ",
+                    )
+                    .bind(response)
+                    .bind(current_llama_sse_response.id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap();
+                }
+                OllamaResponseMessage::Done => break,
+            }
+        }
+
+        let llama_reply_message: Message = sqlx::query_as(
+            "
+        select
+            *
+        from messages
+        where id = ?
+        limit 1;
+        ",
         )
-        .bind(Who::Llama)
-        .bind(response)
-        .bind(conversation_id)
+        .bind(current_llama_sse_response.id)
         .fetch_one(&mut *conn)
         .await
         .map_err(|e| e.to_string())
         .unwrap();
 
         let mut state = state.lock().await;
-        state.history.push(message);
+        state.history.push(llama_reply_message);
     });
 
+    send_chat_message(
+        client,
+        &message,
+        state.ollama_tx.clone(),
+        &mut state.history,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
     Ok(html! {
-            @if let Some(m) = previous_llama_sse_response {
-                template {
-                    tr hx-swap-oob="outerHTML:tr#previous-llama-sse-response" {
-                        td {
-                            (count - 1)
-                        }
-                        td {
-                            (m.inserted_at)
-                        }
-                        td {
-                            (m.who.to_string())
-                        }
-                        td {
-                            pre {
-                                (m.body)
-                            }
-                        }
-                        td {
-                            a hx-post=(format!("/conversations/{}/fork/{}", m.conversation_id, m.id)) {
-                                "Fork"
-                            }
-                        }
-                    }
-                }
-            }
             tr {
                 td {
                     (count)
@@ -592,60 +597,112 @@ async fn messages_create(
                     }
                 }
             }
-            tr id="previous-llama-sse-response" {
+            tr {
                 td {
                     (count + 1)
                 }
                 td {
-                    ""
+                    (current_llama_sse_response.inserted_at)
                 }
                 td {
                     (Who::Llama)
                 }
-                td {
+                // this is slightly confusing, but here's what it does:
+                //
+                // Set up an SSE connection to /messages/response/sse.
+                // This SSE connection continually feeds Ollama chat response
+                // data into the enclosed <pre>, where it just gets appended as text.
+                //
+                // The messages that contain this text chat data
+                // have the type "NewChatData".
+                //
+                // When Ollama is done responding, it sends the Done message.
+                // When we receive Done, this triggers the attached hx-get to
+                // /messages/{message_id}/body, which gets a "clean" version
+                // of this <td> not including any of this SSE or hx stuff.
+                // It only contains the chat data inside the <pre>.
+                td
+                    hx-ext="sse"
+                    sse-connect="/messages/response/sse"
+                    hx-get=(format!("/messages/{}/body", current_llama_sse_response.id))
+                    hx-trigger="sse:Done"
+                    hx-swap="outerHTML"
+                {
                     pre
-                        hx-ext="sse"
-                        sse-connect="/messages/response/sse"
-                        sse-swap="NotDone"
-                        sse-close="Done"
+                        sse-swap="NewChatData"
                         hx-swap="beforeend"
                     {
                         ""
                     }
                 }
                 td {
-                    // Can't fork yet...need the message id once it's actually inserted
+                    a hx-post=(format!("/conversations/{}/fork/{}", current_llama_sse_response.conversation_id, current_llama_sse_response.id)) {
+                        "Fork"
+                    }
                 }
             }
     })
 }
 
+/// the point of this endpoint is to swap out
+/// whatever ollama response <td> has an open SSE connection,
+/// after that SSE connection is finished.
+///
+/// we replace it with this endpoint, which gets rid of all the SSE stuff.
+async fn messages_get_body(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Path(message_id): Path<i64>,
+) -> axum::response::Result<Markup> {
+    let state = state.lock().await;
+    let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+
+    let (body,): (String,) = sqlx::query_as(
+        "
+    select
+        body
+    from messages
+    where id = ?
+    limit 1
+    ",
+    )
+    .bind(message_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(html! {
+        td {
+            pre {
+                (body)
+            }
+        }
+    })
+}
+
 async fn messages_create_sse_handler(
     State(state): State<Arc<Mutex<AppState>>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let ollama_rx = {
-        let mut state = state.lock().await;
+) -> axum::response::Result<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let state = state.lock().await;
 
-        // TODO figure out how to swap something in here...
-        let rx = state.ollama_rx.take().unwrap();
+    let ollama_rx = state.ollama_rx.resubscribe();
 
-        tokio_stream::wrappers::BroadcastStream::new(rx)
-            .map(|chat_chunk| {
-                let cc = chat_chunk.unwrap();
-                if cc.done {
-                    Event::default().event("Done").data("")
-                } else {
-                    Event::default().event("NotDone").data(cc.response)
+    let sse_stream = tokio_stream::wrappers::BroadcastStream::new(ollama_rx)
+        .map(|chat_chunk| {
+            let chat_chunk = chat_chunk.unwrap();
+            match chat_chunk {
+                OllamaResponseMessage::More { response } => {
+                    Event::default().event("NewChatData").data(response)
                 }
-            })
-            .map(Ok)
-    };
+                OllamaResponseMessage::Done => Event::default().event("Done").data(""),
+            }
+        })
+        .map(Ok);
 
-    Sse::new(ollama_rx).keep_alive(
+    Ok(Sse::new(sse_stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(1))
             .text("keep-alive-text"),
-    )
+    ))
 }
 
 async fn conversations_create(
@@ -884,7 +941,8 @@ struct AppState {
     pool: sqlx::Pool<Sqlite>,
     history: Vec<Message>,
     http_client: reqwest::Client,
-    ollama_rx: Option<tokio::sync::broadcast::Receiver<ChatChunk>>,
+    ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
+    ollama_rx: tokio::sync::broadcast::Receiver<OllamaResponseMessage>,
 }
 
 #[derive(Clone, sqlx::Type, Deserialize, Serialize)]
@@ -962,11 +1020,14 @@ async fn main() -> anyhow::Result<()> {
 
     txn.commit().await?;
 
+    let (ollama_tx, ollama_rx) = tokio::sync::broadcast::channel(10);
+
     let state = Arc::new(Mutex::new(AppState {
         pool,
         history: vec![],
         http_client: reqwest::Client::new(),
-        ollama_rx: None,
+        ollama_tx,
+        ollama_rx,
     }));
 
     let app = Router::new()
@@ -987,6 +1048,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
+        .route("/messages/{message_id}/body", get(messages_get_body))
         .route(
             "/dev/state",
             get(|State(state): State<Arc<Mutex<AppState>>>| async move {
