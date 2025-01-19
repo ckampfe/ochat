@@ -624,6 +624,7 @@ async fn messages_create(
                     hx-get=(format!("/messages/{}/body", current_llama_sse_response.id))
                     hx-trigger="sse:Done"
                     hx-swap="outerHTML"
+                    hx-sync="closest td:queue"
                 {
                     pre
                         sse-swap="NewChatData"
