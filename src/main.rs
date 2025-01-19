@@ -28,7 +28,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Form, Router};
 use clap::Parser;
 use futures::Stream;
-use maud::{html, Markup, DOCTYPE};
+use maud::{html, Markup, Render, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, Sqlite};
 use std::collections::HashMap;
@@ -560,6 +560,9 @@ async fn messages_create(
         .unwrap();
 
         let mut state = state.lock().await;
+
+        // state.ollama_tx.send()
+
         state.history.push(llama_reply_message);
     });
 
@@ -604,32 +607,26 @@ async fn messages_create(
                 td {
                     (Who::Llama)
                 }
-                // this is slightly confusing, but here's what it does:
-                //
-                // Set up an SSE connection to /messages/response/sse.
-                // This SSE connection continually feeds Ollama chat response
-                // data into the enclosed <pre>, where it just gets appended as text.
-                //
-                // The messages that contain this text chat data
-                // have the type "NewChatData".
-                //
-                // When Ollama is done responding, it sends the Done message.
-                // When we receive Done, this triggers the attached hx-get to
-                // /messages/{message_id}/body, which gets a "clean" version
-                // of this <td> not including any of this SSE or hx stuff.
-                // It only contains the chat data inside the <pre>.
-                td
-                    hx-ext="sse"
-                    sse-connect="/messages/response/sse"
-                    hx-get=(format!("/messages/{}/body", current_llama_sse_response.id))
-                    hx-trigger="sse:Done"
-                    hx-swap="outerHTML"
-                    hx-sync="closest td:queue"
-                {
-                    pre
-                        sse-swap="NewChatData"
-                        hx-swap="beforeend"
-                    {
+                td {
+                    // this is confusing but here is what it does:
+                    // 1. this element does not (and will never) contain any content
+                    // 2. this element exists solely to hang HTMX SSE attributes on
+                    // 3. it connects to the SSE endpoint and listens for ChatData events
+                    // 4. for all ChatData events except the last one, it appends
+                    //    their data to the "next" element, which is the <pre>
+                    // 5. it does this by appending, i.e., swapping in "beforeend"
+                    // 6. *important* the last ChatData message is a special
+                    //    <div hx-swap-oob="delete:#sse-listener"></div> message,
+                    //    which serves to delete this element, removing
+                    //    the SSE attributes and severing the SSE connection.
+                    div
+                        id="sse-listener"
+                        hx-ext="sse"
+                        sse-connect="/messages/response/sse"
+                        sse-swap="ChatData"
+                        hx-target="next"
+                        hx-swap="beforeend" {}
+                    pre {
                         ""
                     }
                 }
@@ -639,41 +636,6 @@ async fn messages_create(
                     }
                 }
             }
-    })
-}
-
-/// the point of this endpoint is to swap out
-/// whatever ollama response <td> has an open SSE connection,
-/// after that SSE connection is finished.
-///
-/// we replace it with this endpoint, which gets rid of all the SSE stuff.
-async fn messages_get_body(
-    State(state): State<Arc<Mutex<AppState>>>,
-    Path(message_id): Path<i64>,
-) -> axum::response::Result<Markup> {
-    let state = state.lock().await;
-    let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
-
-    let (body,): (String,) = sqlx::query_as(
-        "
-    select
-        body
-    from messages
-    where id = ?
-    limit 1
-    ",
-    )
-    .bind(message_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    Ok(html! {
-        td {
-            pre {
-                (body)
-            }
-        }
     })
 }
 
@@ -689,9 +651,15 @@ async fn messages_create_sse_handler(
             let chat_chunk = chat_chunk.unwrap();
             match chat_chunk {
                 OllamaResponseMessage::More { response } => {
-                    Event::default().event("NewChatData").data(response)
+                    Event::default().event("ChatData").data(response)
                 }
-                OllamaResponseMessage::Done => Event::default().event("Done").data(""),
+                OllamaResponseMessage::Done => Event::default().event("ChatData").data(
+                    html! {
+                        div hx-swap-oob="delete:#sse-listener" {}
+                    }
+                    .render()
+                    .0,
+                ),
             }
         })
         .map(Ok);
@@ -1050,7 +1018,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
-        .route("/messages/{message_id}/body", get(messages_get_body))
         .route(
             "/dev/state",
             get(|State(state): State<Arc<Mutex<AppState>>>| async move {
