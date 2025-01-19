@@ -105,7 +105,6 @@ struct Message {
     who: String,
     conversation_id: i64,
     inserted_at: String,
-    updated_at: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -276,8 +275,7 @@ async fn conversations_show(
             body,
             who,
             conversation_id,
-            inserted_at,
-            updated_at
+            inserted_at
          from messages where conversation_id = ?;",
     )
     .bind(conversation_id)
@@ -472,8 +470,7 @@ async fn messages_create(
         body,
         who,
         conversation_id,
-        inserted_at,
-        updated_at;",
+        inserted_at;",
     )
     .bind(Who::Me)
     .bind(message_send_form.body)
@@ -753,7 +750,11 @@ async fn conversations_fork_create(
     let latest_message: Message = sqlx::query_as(
         "
     select
-        *
+        id,
+        body,
+        who,
+        conversation_id,
+        inserted_at
     from messages
     where id = ?
     limit 1;
