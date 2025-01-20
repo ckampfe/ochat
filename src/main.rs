@@ -398,8 +398,14 @@ async fn conversations_show(
                             hx-swap="none"
                         {
                             @for model in state.available_models.iter() {
-                                option value=(model) {
-                                    (model)
+                                @if *model == state.selected_model {
+                                    option value=(model) selected {
+                                        (model)
+                                    }
+                                } @else {
+                                    option value=(model) {
+                                        (model)
+                                    }
                                 }
                             }
                         }
