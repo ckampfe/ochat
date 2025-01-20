@@ -17,8 +17,8 @@
 // - [ ] cmd+enter to send messages
 // - [x] fix Option::take panic
 // - [ ] xdg spec for app data
-// - [ ] list available local models (curl http://localhost:11434/api/tags)
-// - [ ] selectable models per conversation
+// - [x] list available local models (curl http://localhost:11434/api/tags)
+// - [x] selectable models per conversation
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -56,6 +56,7 @@ enum OllamaResponseMessage {
 async fn send_chat_message(
     client: reqwest::Client,
     message: &Message,
+    model: String,
     ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
     history: &mut Vec<Message>,
 ) -> anyhow::Result<()> {
@@ -70,7 +71,7 @@ async fn send_chat_message(
         prompt.push('\n');
     }
 
-    let body = HashMap::from([("model", "llama3.3".to_string()), ("prompt", prompt)]);
+    let body = HashMap::from([("model", model), ("prompt", prompt)]);
 
     tokio::spawn(async move {
         let mut resp = client
@@ -96,6 +97,29 @@ async fn send_chat_message(
     });
 
     Ok(())
+}
+
+#[derive(Deserialize, Debug)]
+struct Models {
+    models: Vec<Model>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Model {
+    name: String,
+}
+
+async fn get_available_models(client: reqwest::Client) -> anyhow::Result<Vec<String>> {
+    let models: Models = client
+        .get("http://localhost:11434/api/tags")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let models = models.models.into_iter().map(|m| m.name).collect();
+
+    Ok(models)
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -246,6 +270,10 @@ async fn conversations_show(
 ) -> axum::response::Result<maud::Markup> {
     let mut state = state.lock().await;
 
+    state.available_models = get_available_models(state.http_client.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
     let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
 
     let conversation: Conversation = sqlx::query_as(
@@ -336,14 +364,17 @@ async fn conversations_show(
                             }
                         }
                     }
+
                     h2 class="subtitle" {
                         "Started: " (conversation.inserted_at)
                     }
+
                     @if let Some(last_message) = messages.last() {
                         h2 class="subtitle" {
                             "Last message at: " (last_message.inserted_at)
                         }
                     }
+
                     @if let Some(source_conversation_name) = conversation.source_conversation_name {
                         h2 class="subtitle" {
                             "Source: "
@@ -352,11 +383,26 @@ async fn conversations_show(
                             }
                         }
                     }
+
                     a
                         hx-delete=(format!("/conversations/{}/delete", conversation.id))
                         hx-confirm="Really delete? Conversation and all messages will be destroyed."
                     {
                         "Delete conversation"
+                    }
+
+                    div {
+                        select
+                            name="model"
+                            hx-post="/models/select"
+                            hx-swap="none"
+                        {
+                            @for model in state.available_models.iter() {
+                                option value=(model) {
+                                    (model)
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -561,14 +607,13 @@ async fn messages_create(
 
         let mut state = state.lock().await;
 
-        // state.ollama_tx.send()
-
         state.history.push(llama_reply_message);
     });
 
     send_chat_message(
         client,
         &message,
+        state.selected_model.clone(),
         state.ollama_tx.clone(),
         &mut state.history,
     )
@@ -906,11 +951,29 @@ async fn conversations_delete(
     Ok(headers)
 }
 
+#[derive(Deserialize)]
+struct ModelSelection {
+    model: String,
+}
+
+async fn select_model(
+    State(state): State<Arc<Mutex<AppState>>>,
+    Form(model_selection): Form<ModelSelection>,
+) -> axum::response::Result<()> {
+    let mut state = state.lock().await;
+
+    state.selected_model = model_selection.model;
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct AppState {
     pool: sqlx::Pool<Sqlite>,
     history: Vec<Message>,
     http_client: reqwest::Client,
+    available_models: Vec<String>,
+    selected_model: String,
     ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
     ollama_rx: tokio::sync::broadcast::Receiver<OllamaResponseMessage>,
 }
@@ -992,10 +1055,18 @@ async fn main() -> anyhow::Result<()> {
 
     let (ollama_tx, ollama_rx) = tokio::sync::broadcast::channel(10);
 
+    let http_client = reqwest::Client::new();
+
+    let available_models = get_available_models(http_client.clone()).await.unwrap();
+
+    let selected_model = available_models.first().unwrap().to_owned();
+
     let state = Arc::new(Mutex::new(AppState {
         pool,
         history: vec![],
-        http_client: reqwest::Client::new(),
+        http_client,
+        available_models,
+        selected_model,
         ollama_tx,
         ollama_rx,
     }));
@@ -1018,6 +1089,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
+        .route("/models/select", post(select_model))
         .route(
             "/dev/state",
             get(|State(state): State<Arc<Mutex<AppState>>>| async move {
