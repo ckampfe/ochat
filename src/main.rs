@@ -16,6 +16,7 @@
 // - [ ] bulk delete conversations (index)
 // - [ ] cmd+enter to send messages
 // - [x] fix Option::take panic
+// - [x] fix SSE 'Done' not getting sent, by actually working with NDJSON
 // - [ ] xdg spec for app data
 // - [x] list available local models (curl http://localhost:11434/api/tags)
 // - [x] selectable models per conversation
@@ -27,8 +28,8 @@ use axum::response::Sse;
 use axum::routing::{delete, get, post, put};
 use axum::{Form, Router};
 use clap::Parser;
-use futures::Stream;
-use maud::{html, Markup, Render, DOCTYPE};
+use futures::{AsyncBufReadExt, Stream, TryStreamExt};
+use maud::{html, Markup, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, Sqlite};
 use std::collections::HashMap;
@@ -38,6 +39,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
+use tracing::{debug, error};
 
 #[derive(Deserialize, Clone, Debug)]
 struct ChatChunk {
@@ -74,25 +76,47 @@ async fn send_chat_message(
     let body = HashMap::from([("model", model), ("prompt", prompt)]);
 
     tokio::spawn(async move {
-        let mut resp = client
+        let resp = client
             .post("http://localhost:11434/api/generate")
             .json(&body)
             .send()
             .await
             .unwrap();
 
-        // TODO we should be able to propagate some error response
-        // to the client here.
-        while let Some(chunk) = resp.chunk().await.unwrap() {
-            if let Ok(chunk) = serde_json::from_slice::<ChatChunk>(&chunk) {
-                if chunk.done {
-                    let _ = ollama_tx.send(OllamaResponseMessage::Done);
-                } else {
-                    let _ = ollama_tx.send(OllamaResponseMessage::More {
-                        response: chunk.response,
-                    });
+        let bytes_stream = resp
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .into_async_read();
+
+        let reader = futures::io::BufReader::new(bytes_stream);
+
+        let mut lines = reader.lines();
+
+        while let Some(chunk) = lines.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if let Ok(chunk) = serde_json::from_str::<ChatChunk>(&chunk) {
+                        if chunk.done {
+                            let _ = ollama_tx.send(OllamaResponseMessage::Done);
+                            debug!("sent DONE to ollama_tx");
+                        } else {
+                            let _ = ollama_tx.send(OllamaResponseMessage::More {
+                                response: chunk.response,
+                            });
+                            debug!("sent More to ollama_tx");
+                        }
+                    } else {
+                        // TODO we should be able to propagate some error response
+                        // to the client here.
+                        error!("could not deserialize chat chunk: {:?}", chunk);
+                    }
                 }
-            };
+                Err(e) => {
+                    // TODO we should be able to propagate some error response
+                    // to the client here.
+                    error!("error receiving ndjson stream: {:?}", e);
+                }
+            }
         }
     });
 
@@ -659,24 +683,22 @@ async fn messages_create(
                     (Who::Llama)
                 }
                 td {
-                    // this is confusing but here is what it does:
-                    // 1. this element does not (and will never) contain any content
-                    // 2. this element exists solely to hang HTMX SSE attributes on
-                    // 3. it connects to the SSE endpoint and listens for ChatData events
-                    // 4. for all ChatData events except the last one, it appends
-                    //    their data to the "next" element, which is the <pre>
-                    // 5. it does this by appending, i.e., swapping in "beforeend"
-                    // 6. *important* the last ChatData message is a special
-                    //    <div hx-swap-oob="delete:#sse-listener"></div> message,
-                    //    which serves to delete this element, removing
-                    //    the SSE attributes and severing the SSE connection.
+                    // TODO
+                    // document what this whole thing does...
                     div
                         id="sse-listener"
                         hx-ext="sse"
                         sse-connect="/messages/response/sse"
                         sse-swap="ChatData"
                         hx-target="next"
-                        hx-swap="beforeend" {}
+                        hx-swap="beforeend"
+                    {
+                        div
+                        hx-get="/empty"
+                        hx-trigger="sse:ChatDone"
+                        hx-target="#sse-listener"
+                        hx-swap="delete" {}
+                    }
                     pre {
                         ""
                     }
@@ -704,13 +726,10 @@ async fn messages_create_sse_handler(
                 OllamaResponseMessage::More { response } => {
                     Event::default().event("ChatData").data(response)
                 }
-                OllamaResponseMessage::Done => Event::default().event("ChatData").data(
-                    html! {
-                        div hx-swap-oob="delete:#sse-listener" {}
-                    }
-                    .render()
-                    .0,
-                ),
+                OllamaResponseMessage::Done => {
+                    debug!("Sending 'Done' SSE message");
+                    Event::default().event("ChatDone").data("")
+                }
             }
         })
         .map(Ok);
@@ -1095,6 +1114,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
+        .route("/empty", get(|| async {}))
         .route("/models/select", post(select_model))
         .route(
             "/dev/state",
