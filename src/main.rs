@@ -42,7 +42,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error};
 
 #[derive(Deserialize, Clone, Debug)]
-struct ChatChunk {
+struct ChatResponse {
     // model: String,
     // created_at: String,
     response: String,
@@ -92,23 +92,23 @@ async fn send_chat_message(
 
         let mut lines = reader.lines();
 
-        while let Some(chunk) = lines.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    if let Ok(chunk) = serde_json::from_str::<ChatChunk>(&chunk) {
-                        if chunk.done {
+        while let Some(line) = lines.next().await {
+            match line {
+                Ok(line) => {
+                    if let Ok(chat_response) = serde_json::from_str::<ChatResponse>(&line) {
+                        if chat_response.done {
                             let _ = ollama_tx.send(OllamaResponseMessage::Done);
                             debug!("sent DONE to ollama_tx");
                         } else {
                             let _ = ollama_tx.send(OllamaResponseMessage::More {
-                                response: chunk.response,
+                                response: chat_response.response,
                             });
                             debug!("sent More to ollama_tx");
                         }
                     } else {
                         // TODO we should be able to propagate some error response
                         // to the client here.
-                        error!("could not deserialize chat chunk: {:?}", chunk);
+                        error!("could not deserialize chat chunk: {:?}", line);
                     }
                 }
                 Err(e) => {
