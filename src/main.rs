@@ -162,7 +162,7 @@ struct Conversation {
     source_conversation_id: Option<i64>,
     source_conversation_name: Option<String>,
     inserted_at: String,
-    updated_at: String,
+    // updated_at: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -172,7 +172,7 @@ struct ConversationWithLastMessageTime {
     source_conversation_id: Option<i64>,
     source_conversation_name: Option<String>,
     inserted_at: String,
-    updated_at: String,
+    // updated_at: String,
     last_message_inserted_at: String,
 }
 
@@ -191,7 +191,7 @@ async fn conversations_index(
             c2.name as source_conversation_name,
             c2.id as source_conversation_id,
             conversations.inserted_at,
-            conversations.updated_at,
+            -- conversations.updated_at,
             last_messages.last_message_inserted_at
         from conversations
         inner join (
@@ -307,8 +307,8 @@ async fn conversations_show(
         conversations.name,
         conversations.source_conversation_id,
         c2.name as source_conversation_name,
-        conversations.inserted_at,
-        conversations.updated_at
+        conversations.inserted_at
+        -- conversations.updated_at
     from conversations
     left join conversations c2
         on conversations.source_conversation_id = c2.id
