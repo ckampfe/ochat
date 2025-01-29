@@ -23,14 +23,17 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
+use axum::response::sse::Event;
+use axum::response::Sse;
 use axum::routing::{delete, get, post, put};
 use axum::{Form, Router};
 use clap::Parser;
-use futures::{AsyncBufReadExt, TryStreamExt};
+use futures::{AsyncBufReadExt, Stream, TryStreamExt};
 use maud::{html, Markup, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, Sqlite};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -46,7 +49,7 @@ struct ChatResponse {
     done: bool,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 enum OllamaResponseMessage {
     More { response: String },
     Done,
@@ -343,6 +346,7 @@ async fn conversations_show(
                 "conversations"
             }
             script src="https://unpkg.com/htmx.org@2.0.4" {}
+            script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" {}
             link
                 rel="stylesheet"
                 href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
@@ -679,16 +683,24 @@ async fn messages_create(
                     (Who::Llama)
                 }
                 td {
-                    pre
-                        hx-get=(format!("/messages/{}/next_chunk", current_llama_sse_response.id))
-                        hx-trigger="load"
-                        hx-swap="outerHTML"
+                    // TODO
+                    // document what this whole thing does...
+                    div
+                        id="sse-listener"
+                        hx-ext="sse"
+                        sse-connect="/messages/response/sse"
+                        sse-swap="ChatData"
+                        hx-target="next"
+                        hx-swap="beforeend"
                     {
-                        (if state.ticker == Ticker::SolidBlock {
-                            "\u{2588}"
-                        } else {
-                            "\u{3000}"
-                        })
+                        div
+                        hx-get="/empty"
+                        hx-trigger="sse:ChatDone"
+                        hx-target="#sse-listener"
+                        hx-swap="delete" {}
+                    }
+                    pre {
+                        ""
                     }
                 }
                 td {
@@ -700,95 +712,33 @@ async fn messages_create(
     })
 }
 
-async fn messages_next_chunk(
+async fn messages_create_sse_handler(
     State(state): State<Arc<Mutex<AppState>>>,
-    Path(message_id): Path<i64>,
-) -> axum::response::Result<Markup> {
-    let mut state = state.lock().await;
+) -> axum::response::Result<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let state = state.lock().await;
 
-    let mut message_chunks = vec![];
+    let ollama_rx = state.ollama_rx.resubscribe();
 
-    while let Ok(ollama_response) = state.ollama_rx.try_recv() {
-        message_chunks.push(ollama_response);
-    }
-
-    if !message_chunks.is_empty() {
-        let is_done = message_chunks
-            .iter()
-            .any(|chunk| *chunk == OllamaResponseMessage::Done);
-
-        let next_part_of_message = message_chunks
-            .iter()
-            .cloned()
-            .filter_map(|chunk| match chunk {
-                OllamaResponseMessage::More { response } => Some(response),
-                OllamaResponseMessage::Done => None,
-            })
-            .collect::<String>();
-
-        state.message.push_str(&next_part_of_message);
-
-        if is_done {
-            let mut message = String::new();
-
-            std::mem::swap(&mut state.message, &mut message);
-
-            Ok(html! {
-                pre {
-                    (message)
+    let sse_stream = tokio_stream::wrappers::BroadcastStream::new(ollama_rx)
+        .map(|chat_chunk| {
+            let chat_chunk = chat_chunk.unwrap();
+            match chat_chunk {
+                OllamaResponseMessage::More { response } => {
+                    Event::default().event("ChatData").data(response)
                 }
-            })
-        } else {
-            let mut with_block = state.message.clone();
-            with_block.push('\u{2588}');
-
-            Ok(html! {
-                pre
-                    hx-get=(format!("/messages/{}/next_chunk", message_id))
-                    hx-trigger="load delay:120ms"
-                    hx-sync="this:replace"
-                    hx-swap="outerHTML"
-                {
-                    (with_block)
+                OllamaResponseMessage::Done => {
+                    debug!("Sending 'Done' SSE message");
+                    Event::default().event("ChatDone").data("")
                 }
-            })
-        }
-    } else if !state.message.is_empty() {
-        let mut with_block = state.message.clone();
-        with_block.push('\u{2588}');
-
-        Ok(html! {
-            pre
-                hx-get=(format!("/messages/{}/next_chunk", message_id))
-                hx-trigger="load delay:200ms"
-                hx-sync="this:replace"
-                hx-swap="outerHTML"
-            {
-                (with_block)
             }
         })
-    } else {
-        if state.ticker == Ticker::SolidBlock {
-            state.ticker = Ticker::EmptyBlock
-        } else {
-            state.ticker = Ticker::SolidBlock
-        }
+        .map(Ok);
 
-        Ok(html! {
-            pre
-                hx-get=(format!("/messages/{}/next_chunk", message_id))
-                hx-trigger="load delay:1s"
-                hx-sync="this:abort"
-                hx-swap="outerHTML"
-            {
-                (if state.ticker == Ticker::SolidBlock {
-                    "\u{2588}"
-                } else {
-                    "\u{3000}"
-                })
-            }
-        })
-    }
+    Ok(Sse::new(sse_stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(1))
+            .text("keep-alive-text"),
+    ))
 }
 
 async fn conversations_create(
@@ -1051,14 +1001,6 @@ struct AppState {
     selected_model: String,
     ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
     ollama_rx: tokio::sync::broadcast::Receiver<OllamaResponseMessage>,
-    message: String,
-    ticker: Ticker,
-}
-
-#[derive(Debug, PartialEq)]
-enum Ticker {
-    SolidBlock,
-    EmptyBlock,
 }
 
 #[derive(Clone, sqlx::Type, Deserialize, Serialize)]
@@ -1152,8 +1094,6 @@ async fn main() -> anyhow::Result<()> {
         selected_model,
         ollama_tx,
         ollama_rx,
-        message: String::new(),
-        ticker: Ticker::EmptyBlock,
     }));
 
     let app = Router::new()
@@ -1173,7 +1113,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/conversations/new", post(conversations_create))
         .route("/messages/new", post(messages_create))
-        .route("/messages/{id}/next_chunk", get(messages_next_chunk))
+        .route("/messages/response/sse", get(messages_create_sse_handler))
         .route("/empty", get(|| async {}))
         .route("/models/select", post(select_model))
         .route(
