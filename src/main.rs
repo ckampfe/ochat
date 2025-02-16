@@ -43,7 +43,6 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error};
 
 const FILLED_BLOCK: char = '\u{2588}';
-const EMPTY_BLOCK: char = '\u{3000}';
 
 #[derive(Deserialize, Clone, Debug)]
 struct ChatResponse {
@@ -366,7 +365,7 @@ async fn conversations_show(
                 const filledBlock = '\\u{2588}';
                 const emptyBlock = '\\u{3000}';
 
-                var shouldAddCursor = true;
+                var shouldAddCursor = false;
                 var timer;
 
                 function swap(id, a, b) {
@@ -764,7 +763,7 @@ async fn messages_create(
                     }
                     // javascript removes this id when the llm is done responding
                     pre id="llm-response" {
-                        (EMPTY_BLOCK)
+                        (FILLED_BLOCK)
                     }
                 }
                 td {
