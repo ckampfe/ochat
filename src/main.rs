@@ -20,6 +20,7 @@
 // - [ ] xdg spec for app data
 // - [x] list available local models (curl http://localhost:11434/api/tags)
 // - [x] selectable models per conversation
+// - [x] ticker to indicate that the model is thinking
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -40,6 +41,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tracing::{debug, error};
+
+const FILLED_BLOCK: char = '\u{2588}';
+const EMPTY_BLOCK: char = '\u{3000}';
 
 #[derive(Deserialize, Clone, Debug)]
 struct ChatResponse {
@@ -248,7 +252,7 @@ async fn conversations_index(
                         }
                     }
                 }
-                table class="table" {
+                table class="table container" {
                     thead {
                         tr {
                             th { "started" }
@@ -357,6 +361,65 @@ async fn conversations_show(
                 }
                 "
             }
+            script {
+                "
+                const filledBlock = '\\u{2588}';
+                const emptyBlock = '\\u{3000}';
+
+                var shouldAddCursor = true;
+                var timer;
+
+                function swap(id, a, b) {
+                    let el = document.getElementById(id);
+                    el.innerHTML = el.innerHTML.replace(a, b);
+                }
+
+                function removeAllBlocks(id) {
+                    swap(id, emptyBlock, '');
+                    swap(id, filledBlock, '');
+                }
+
+                function alternateCursor() {
+                    if(shouldAddCursor) {
+                        swap('llm-response', emptyBlock, filledBlock);
+                        shouldAddCursor = false;
+                    } else {
+                        swap('llm-response', filledBlock, emptyBlock);
+                        shouldAddCursor = true;
+                    }
+                }
+
+                function startTimer() {
+                    timer = setInterval(alternateCursor, 1000);
+                }
+
+                function stopTimer() {
+                    clearInterval(timer);
+                    timer = null;
+                }
+
+                document.addEventListener('htmx:sseBeforeMessage', function (e) {
+                    if(timer) {
+                        stopTimer();
+                    }
+                    removeAllBlocks('llm-response');
+                });
+
+                document.addEventListener('htmx:sseClose', function (e) {
+                    stopTimer();
+                    removeAllBlocks('llm-response');
+                    const responseEl = document.getElementById('llm-response');
+                    responseEl.removeAttribute('id');
+                });
+
+                document.addEventListener('htmx:afterRequest', function(e) {
+                    // TODO base this on an id instead
+                    if(e.srcElement.tagName === 'FORM') {
+                        startTimer();
+                    }
+                });
+                "
+            }
         }
         body {
             div class="container mb-5" {
@@ -436,7 +499,7 @@ async fn conversations_show(
                     }
                 }
 
-                table class="table" {
+                table class="table container" {
                     thead {
                         tr {
                             th {
@@ -699,8 +762,9 @@ async fn messages_create(
                         hx-target="#sse-listener"
                         hx-swap="delete" {}
                     }
-                    pre {
-                        ""
+                    // javascript removes this id when the llm is done responding
+                    pre id="llm-response" {
+                        (EMPTY_BLOCK)
                     }
                 }
                 td {
@@ -723,7 +787,8 @@ async fn messages_create_sse_handler(
         .map(|chat_chunk| {
             let chat_chunk = chat_chunk.unwrap();
             match chat_chunk {
-                OllamaResponseMessage::More { response } => {
+                OllamaResponseMessage::More { mut response } => {
+                    response.push(FILLED_BLOCK);
                     Event::default().event("ChatData").data(response)
                 }
                 OllamaResponseMessage::Done => {
