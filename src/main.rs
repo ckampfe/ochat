@@ -21,6 +21,7 @@
 // - [x] list available local models (curl http://localhost:11434/api/tags)
 // - [x] selectable models per conversation
 // - [x] ticker to indicate that the model is thinking
+// - [x] get rid of in-memory history, load all from db every time
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
@@ -32,13 +33,14 @@ use clap::Parser;
 use futures::{AsyncBufReadExt, Stream, TryStreamExt};
 use maud::{html, Markup, DOCTYPE};
 use serde::{Deserialize, Serialize};
+use sqlx::pool::PoolConnection;
 use sqlx::{Acquire, Sqlite};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tokio_stream::StreamExt;
 use tracing::{debug, error};
 
@@ -60,16 +62,13 @@ enum OllamaResponseMessage {
 
 async fn send_chat_message(
     client: reqwest::Client,
-    message: &Message,
+    messages: &[Message],
     model: String,
-    ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
-    history: &mut Vec<Message>,
+    ollama_tx: broadcast::Sender<OllamaResponseMessage>,
 ) -> anyhow::Result<()> {
-    history.push(message.clone());
-
     let mut prompt = String::new();
 
-    for message in history {
+    for message in messages {
         prompt.push_str(&message.who.to_string());
         prompt.push_str(": ");
         prompt.push_str(&message.body);
@@ -338,8 +337,6 @@ async fn conversations_show(
     .await
     .map_err(|e| e.to_string())?;
 
-    state.history = messages.clone();
-
     Ok(html! {
         (DOCTYPE)
         head {
@@ -590,11 +587,20 @@ async fn messages_create(
     State(state): State<Arc<Mutex<AppState>>>,
     Form(message_send_form): Form<MessageSendForm>,
 ) -> axum::response::Result<Markup> {
-    let state_for_response = Arc::clone(&state);
+    let conversation_id = message_send_form.conversation_id;
 
-    let mut state = state.lock().await;
+    let state = state.lock().await;
 
     let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+    let conn2 = state.pool.acquire().await.map_err(|e| e.to_string())?;
+    let http_client = state.http_client.clone();
+    let ollama_tx = state.ollama_tx.clone();
+    let ollama_rx2 = state.ollama_rx.resubscribe();
+    let selected_model = state.selected_model.clone();
+
+    drop(state);
+
+    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
 
     let message: Message = sqlx::query_as(
         "
@@ -612,28 +618,32 @@ async fn messages_create(
     )
     .bind(Who::Me)
     .bind(message_send_form.body)
-    .bind(message_send_form.conversation_id)
-    .fetch_one(&mut *conn)
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (count,): (i64,) = sqlx::query_as(
-        "select
-        count(*)
-    from messages
-    where conversation_id = ?;
-    ",
+    let messages: Vec<Message> = sqlx::query_as(
+        "
+        select 
+            id,
+            body,
+            who,
+            conversation_id,
+            inserted_at
+        from messages
+        where conversation_id = ?
+        order by inserted_at, id;
+        ",
     )
-    .bind(message_send_form.conversation_id)
-    .fetch_one(&mut *conn)
+    .bind(conversation_id)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
-
-    let conversation_id = message_send_form.conversation_id;
 
     // create the reply from llama.
     // initially, it's empty.
-    let current_llama_sse_response: Message = sqlx::query_as(
+    let ollama_response: Message = sqlx::query_as(
         "
         insert into messages (
             who,
@@ -646,71 +656,19 @@ async fn messages_create(
     .bind(Who::Llama)
     .bind("")
     .bind(conversation_id)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
-    let client = state.http_client.clone();
+    tx.commit().await.map_err(|e| e.to_string())?;
 
-    let ollama_rx2 = state.ollama_rx.resubscribe();
+    spawn_llm_response_update_task(conn2, ollama_response.id, ollama_rx2);
 
-    let conn2 = state.pool.acquire().await.map_err(|e| e.to_string())?;
-
-    tokio::spawn(async move {
-        let state = state_for_response;
-        let mut conn = conn2;
-        let mut ollama_rx = ollama_rx2;
-
-        while let Ok(chat_chunk) = ollama_rx.recv().await {
-            match chat_chunk {
-                OllamaResponseMessage::More { response } => {
-                    sqlx::query(
-                        "
-                        update messages
-                        set body = body || ?
-                         where id = ?
-                         ",
-                    )
-                    .bind(response)
-                    .bind(current_llama_sse_response.id)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .unwrap();
-                }
-                OllamaResponseMessage::Done => break,
-            }
-        }
-
-        let llama_reply_message: Message = sqlx::query_as(
-            "
-        select
-            *
-        from messages
-        where id = ?
-        limit 1;
-        ",
-        )
-        .bind(current_llama_sse_response.id)
-        .fetch_one(&mut *conn)
+    send_chat_message(http_client, &messages, selected_model, ollama_tx)
         .await
-        .map_err(|e| e.to_string())
-        .unwrap();
+        .map_err(|e| e.to_string())?;
 
-        let mut state = state.lock().await;
-
-        state.history.push(llama_reply_message);
-    });
-
-    send_chat_message(
-        client,
-        &message,
-        state.selected_model.clone(),
-        state.ollama_tx.clone(),
-        &mut state.history,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let count = messages.len();
 
     Ok(html! {
             tr {
@@ -739,7 +697,7 @@ async fn messages_create(
                     (count + 1)
                 }
                 td {
-                    (current_llama_sse_response.inserted_at)
+                    (ollama_response.inserted_at)
                 }
                 td {
                     (Who::Llama)
@@ -767,12 +725,42 @@ async fn messages_create(
                     }
                 }
                 td {
-                    a hx-post=(format!("/conversations/{}/fork/{}", current_llama_sse_response.conversation_id, current_llama_sse_response.id)) {
+                    a hx-post=(format!("/conversations/{}/fork/{}", ollama_response.conversation_id, ollama_response.id)) {
                         "Fork"
                     }
                 }
             }
     })
+}
+
+fn spawn_llm_response_update_task(
+    mut conn: PoolConnection<Sqlite>,
+    ollama_response_message_id: i64,
+    mut ollama_rx: broadcast::Receiver<OllamaResponseMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(chat_chunk) = ollama_rx.recv().await {
+            match chat_chunk {
+                OllamaResponseMessage::More { response } => {
+                    sqlx::query(
+                        "
+                        update messages
+                        set body = body || ?
+                         where id = ?
+                         ",
+                    )
+                    .bind(response)
+                    .bind(ollama_response_message_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())
+                    // TODO add some error channel here instead of unwrapping
+                    .unwrap();
+                }
+                OllamaResponseMessage::Done => break,
+            }
+        }
+    });
 }
 
 async fn messages_create_sse_handler(
@@ -1059,12 +1047,11 @@ async fn select_model(
 #[derive(Debug)]
 struct AppState {
     pool: sqlx::Pool<Sqlite>,
-    history: Vec<Message>,
     http_client: reqwest::Client,
     available_models: Vec<String>,
     selected_model: String,
-    ollama_tx: tokio::sync::broadcast::Sender<OllamaResponseMessage>,
-    ollama_rx: tokio::sync::broadcast::Receiver<OllamaResponseMessage>,
+    ollama_tx: broadcast::Sender<OllamaResponseMessage>,
+    ollama_rx: broadcast::Receiver<OllamaResponseMessage>,
 }
 
 #[derive(Clone, sqlx::Type, Deserialize, Serialize)]
@@ -1142,7 +1129,7 @@ async fn main() -> anyhow::Result<()> {
 
     txn.commit().await?;
 
-    let (ollama_tx, ollama_rx) = tokio::sync::broadcast::channel(10);
+    let (ollama_tx, ollama_rx) = broadcast::channel(10);
 
     let http_client = reqwest::Client::new();
 
@@ -1152,7 +1139,6 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(AppState {
         pool,
-        history: vec![],
         http_client,
         available_models,
         selected_model,
