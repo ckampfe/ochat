@@ -487,12 +487,13 @@ async fn conversations_show(
                 }
                 div {
                     form
+                        id="chat-input-form"
                         hx-post="/messages/new"
                         hx-target="#messages"
                         hx-swap="beforeend"
                         // https://htmx.org/examples/keyboard-shortcuts/
                         // hx-trigger="keyup[metaKey&&key=='Enter'], keyup[shiftKey&&key=='Enter'] from:body"
-                        hx-on::after-request=" if(event.detail.successful) this.reset()"
+                        hx-on::after-request="if(event.detail.successful) this.reset()"
                     {
                         div class="field" {
                             div class="control" {

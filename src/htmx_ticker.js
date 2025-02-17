@@ -48,8 +48,7 @@ document.addEventListener('htmx:sseClose', function (e) {
 });
 
 document.addEventListener('htmx:afterRequest', function (e) {
-    // TODO base this on an id instead
-    if (e.srcElement.tagName === 'FORM') {
+    if (e.target.id === 'chat-input-form') {
         startTimer();
     }
 });
