@@ -22,16 +22,19 @@
 // - [x] selectable models per conversation
 // - [x] ticker to indicate that the model is thinking
 // - [x] get rid of in-memory history, load all from db every time
+// - [x] cache/store available models in db
+// - [x] store model on conversation,
+//       to persist it when switching between conversations
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue};
-use axum::response::sse::Event;
 use axum::response::Sse;
+use axum::response::sse::Event;
 use axum::routing::{delete, get, post, put};
 use axum::{Form, Router};
 use clap::Parser;
 use futures::{AsyncBufReadExt, Stream, TryStreamExt};
-use maud::{html, Markup, DOCTYPE};
+use maud::{DOCTYPE, Markup, html};
 use serde::{Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::{Acquire, Sqlite};
@@ -40,7 +43,7 @@ use std::convert::Infallible;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt;
 use tracing::{debug, error};
 
@@ -126,17 +129,17 @@ async fn send_chat_message(
 }
 
 #[derive(Deserialize, Debug)]
-struct Models {
-    models: Vec<Model>,
+struct OllamaModelsResponse {
+    models: Vec<OllamaModelResponse>,
 }
 
 #[derive(Deserialize, Debug)]
-struct Model {
+struct OllamaModelResponse {
     name: String,
 }
 
 async fn get_available_models(client: reqwest::Client) -> anyhow::Result<Vec<String>> {
-    let models: Models = client
+    let models: OllamaModelsResponse = client
         .get("http://localhost:11434/api/tags")
         .send()
         .await?
@@ -146,6 +149,12 @@ async fn get_available_models(client: reqwest::Client) -> anyhow::Result<Vec<Str
     let models = models.models.into_iter().map(|m| m.name).collect();
 
     Ok(models)
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct Model {
+    id: i64,
+    name: String,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -161,6 +170,7 @@ struct Message {
 struct Conversation {
     id: i64,
     name: String,
+    model: String,
     source_conversation_id: Option<i64>,
     source_conversation_name: Option<String>,
     inserted_at: String,
@@ -221,7 +231,16 @@ async fn conversations_index(
             title {
                 "conversations"
             }
-            script src="https://unpkg.com/htmx.org@2.0.4" {}
+            // minified
+            script
+                src="https://unpkg.com/htmx.org@2.0.4"
+                integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+                crossorigin="anonymous" {}
+            // unminified
+            // script
+            //     src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.js"
+            //     integrity="sha384-oeUn82QNXPuVkGCkcrInrS1twIxKhkZiFfr2TdiuObZ3n3yIeMiqcRzkIcguaof1"
+            //     crossorigin="anonymous" {}
             link
                 rel="stylesheet"
                 href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
@@ -294,19 +313,52 @@ async fn conversations_show(
     State(state): State<Arc<Mutex<AppState>>>,
     Path(conversation_id): Path<i64>,
 ) -> axum::response::Result<maud::Markup> {
-    let mut state = state.lock().await;
+    let state = state.lock().await;
 
-    state.available_models = get_available_models(state.http_client.clone())
+    let available_models = get_available_models(state.http_client.clone())
         .await
         .map_err(|e| e.to_string())?;
 
     let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+
+    drop(state);
+
+    let mut txn = conn.begin().await.map_err(|e| e.to_string())?;
+
+    // TODO determine if we want to do this every time we load a conversation
+    for model in available_models {
+        sqlx::query(
+            "
+        insert into models
+        (name) values (?)
+        on conflict do nothing;
+        ",
+        )
+        .bind(model)
+        .execute(&mut *txn)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    let models: Vec<Model> = sqlx::query_as(
+        "
+        select
+            id,
+            name
+        from models
+        order by name;
+        ",
+    )
+    .fetch_all(&mut *txn)
+    .await
+    .map_err(|e| e.to_string())?;
 
     let conversation: Conversation = sqlx::query_as(
         "
     select
         conversations.id,
         conversations.name,
+        models.name as model,
         conversations.source_conversation_id,
         c2.name as source_conversation_name,
         conversations.inserted_at
@@ -314,11 +366,14 @@ async fn conversations_show(
     from conversations
     left join conversations c2
         on conversations.source_conversation_id = c2.id
-    where conversations.id = ?;
+    inner join models
+        on models.id = conversations.model_id
+    where conversations.id = ?
+    limit 1;
     ",
     )
     .bind(conversation_id)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *txn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -333,9 +388,11 @@ async fn conversations_show(
          from messages where conversation_id = ?;",
     )
     .bind(conversation_id)
-    .fetch_all(&mut *conn)
+    .fetch_all(&mut *txn)
     .await
     .map_err(|e| e.to_string())?;
+
+    txn.commit().await.map_err(|e| e.to_string())?;
 
     Ok(html! {
         (DOCTYPE)
@@ -345,7 +402,10 @@ async fn conversations_show(
             title {
                 "conversations"
             }
-            script src="https://unpkg.com/htmx.org@2.0.4" {}
+            script
+                src="https://unpkg.com/htmx.org@2.0.4"
+                integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+                crossorigin="anonymous" {}
             script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" {}
             link
                 rel="stylesheet"
@@ -420,18 +480,18 @@ async fn conversations_show(
 
                     div {
                         select
-                            name="model"
-                            hx-post="/models/select"
+                            name="model-id"
+                            hx-post=(format!("/models/select/{}", conversation.id))
                             hx-swap="none"
                         {
-                            @for model in state.available_models.iter() {
-                                @if *model == state.selected_model {
-                                    option value=(model) selected {
-                                        (model)
+                            @for model in models.iter() {
+                                @if *model.name == conversation.model {
+                                    option value=(model.id) selected {
+                                        (model.name)
                                     }
                                 } @else {
-                                    option value=(model) {
-                                        (model)
+                                    option value=(model.id) {
+                                        (model.name)
                                     }
                                 }
                             }
@@ -541,11 +601,10 @@ async fn messages_create(
     let http_client = state.http_client.clone();
     let ollama_tx = state.ollama_tx.clone();
     let ollama_rx2 = state.ollama_rx.resubscribe();
-    let selected_model = state.selected_model.clone();
 
     drop(state);
 
-    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
+    let mut txn = conn.begin().await.map_err(|e| e.to_string())?;
 
     let message: Message = sqlx::query_as(
         "
@@ -564,7 +623,7 @@ async fn messages_create(
     .bind(Who::Me)
     .bind(message_send_form.body)
     .bind(conversation_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *txn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -582,7 +641,7 @@ async fn messages_create(
         ",
     )
     .bind(conversation_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *txn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -601,15 +660,32 @@ async fn messages_create(
     .bind(Who::Llama)
     .bind("")
     .bind(conversation_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *txn)
     .await
     .map_err(|e| e.to_string())?;
 
-    tx.commit().await.map_err(|e| e.to_string())?;
+    let model: Model = sqlx::query_as(
+        "
+    select
+        models.id,
+        models.name
+    from models
+    inner join conversations
+        on conversations.model_id = models.id
+    where conversations.id = ?
+    limit 1;
+    ",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *txn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    txn.commit().await.map_err(|e| e.to_string())?;
 
     spawn_llm_response_update_task(conn2, ollama_response.id, ollama_rx2);
 
-    send_chat_message(http_client, &messages, selected_model, ollama_tx)
+    send_chat_message(http_client, &messages, model.name, ollama_tx)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -975,16 +1051,31 @@ async fn conversations_delete(
 
 #[derive(Deserialize)]
 struct ModelSelection {
-    model: String,
+    #[serde(rename(deserialize = "model-id"))]
+    model_id: i64,
 }
 
 async fn select_model(
     State(state): State<Arc<Mutex<AppState>>>,
+    Path(conversation_id): Path<i64>,
     Form(model_selection): Form<ModelSelection>,
 ) -> axum::response::Result<()> {
-    let mut state = state.lock().await;
+    let state = state.lock().await;
 
-    state.selected_model = model_selection.model;
+    let mut conn = state.pool.acquire().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "
+    update conversations
+    set model_id = ?
+    where id = ?
+    ",
+    )
+    .bind(model_selection.model_id)
+    .bind(conversation_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -993,8 +1084,6 @@ async fn select_model(
 struct AppState {
     pool: sqlx::Pool<Sqlite>,
     http_client: reqwest::Client,
-    available_models: Vec<String>,
-    selected_model: String,
     ollama_tx: broadcast::Sender<OllamaResponseMessage>,
     ollama_rx: broadcast::Receiver<OllamaResponseMessage>,
 }
@@ -1046,13 +1135,32 @@ async fn main() -> anyhow::Result<()> {
     let mut txn = connection.begin().await?;
 
     sqlx::query(
+        "create table if not exists models (
+            id integer primary key autoincrement not null,
+            name text not null,
+            inserted_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+            updated_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
+        );
+        ",
+    )
+    .execute(&mut *txn)
+    .await?;
+
+    sqlx::query("create unique index if not exists models_name on models (name);")
+        .execute(&mut *txn)
+        .await?;
+
+    sqlx::query(
         "create table if not exists conversations (
             id integer primary key autoincrement not null,
             name text not null,
+            model_id integer not null default 1,
             source_conversation_id integer,
             inserted_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
-            updated_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
-        )",
+            updated_at datetime not null default(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
+
+            foreign key(model_id) references models(id)
+        );",
     )
     .execute(&mut *txn)
     .await?;
@@ -1080,13 +1188,26 @@ async fn main() -> anyhow::Result<()> {
 
     let available_models = get_available_models(http_client.clone()).await.unwrap();
 
-    let selected_model = available_models.first().unwrap().to_owned();
+    let mut txn = connection.begin().await?;
+
+    for model in available_models {
+        sqlx::query(
+            "
+        insert into models
+        (name) values (?)
+        on conflict do nothing;
+        ",
+        )
+        .bind(model)
+        .execute(&mut *txn)
+        .await?;
+    }
+
+    txn.commit().await?;
 
     let state = Arc::new(Mutex::new(AppState {
         pool,
         http_client,
-        available_models,
-        selected_model,
         ollama_tx,
         ollama_rx,
     }));
@@ -1110,7 +1231,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
         .route("/empty", get(|| async {}))
-        .route("/models/select", post(select_model))
+        .route("/models/select/{conversation_id}", post(select_model))
         .route(
             "/dev/state",
             get(|State(state): State<Arc<Mutex<AppState>>>| async move {
