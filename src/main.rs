@@ -49,6 +49,48 @@ use tracing::{debug, error};
 
 const FILLED_BLOCK: char = '\u{2588}';
 
+macro_rules! layout {
+    ($content:expr) => {
+        html! {
+            (DOCTYPE)
+            head {
+                meta charset="UTF-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title {
+                    "conversations"
+                }
+                // minified
+                script
+                    src="https://unpkg.com/htmx.org@2.0.4"
+                    integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+                    crossorigin="anonymous" {}
+                script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" {}
+                // unminified
+                // script
+                //     src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.js"
+                //     integrity="sha384-oeUn82QNXPuVkGCkcrInrS1twIxKhkZiFfr2TdiuObZ3n3yIeMiqcRzkIcguaof1"
+                //     crossorigin="anonymous" {}
+                link
+                    rel="stylesheet"
+                    href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
+                style {
+                    "
+                    pre {
+                        white-space: pre-wrap;
+                    }
+                    "
+                }
+                script {
+                    (include_str!("htmx_ticker.js"))
+                }
+            }
+            body {
+                ($content)
+            }
+        }
+    }
+}
+
 #[derive(Deserialize, Clone, Debug)]
 struct ChatResponse {
     // model: String,
@@ -223,36 +265,8 @@ async fn conversations_index(
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(html! {
-        (DOCTYPE)
-        head {
-            meta charset="UTF-8";
-            meta name="viewport" content="width=device-width, initial-scale=1";
-            title {
-                "conversations"
-            }
-            // minified
-            script
-                src="https://unpkg.com/htmx.org@2.0.4"
-                integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
-                crossorigin="anonymous" {}
-            // unminified
-            // script
-            //     src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.js"
-            //     integrity="sha384-oeUn82QNXPuVkGCkcrInrS1twIxKhkZiFfr2TdiuObZ3n3yIeMiqcRzkIcguaof1"
-            //     crossorigin="anonymous" {}
-            link
-                rel="stylesheet"
-                href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
-            style {
-                "
-                pre {
-                    white-space: pre-wrap;
-                }
-                "
-            }
-        }
-        body {
+    Ok(layout! {
+        html! {
             div class="container mb-5" {
                 nav class="level" {
                     div class="level-left" {
@@ -394,34 +408,8 @@ async fn conversations_show(
 
     txn.commit().await.map_err(|e| e.to_string())?;
 
-    Ok(html! {
-        (DOCTYPE)
-        head {
-            meta charset="UTF-8";
-            meta name="viewport" content="width=device-width, initial-scale=1";
-            title {
-                "conversations"
-            }
-            script
-                src="https://unpkg.com/htmx.org@2.0.4"
-                integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
-                crossorigin="anonymous" {}
-            script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" {}
-            link
-                rel="stylesheet"
-                href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
-            style {
-                "
-                pre {
-                    white-space: pre-wrap;
-                }
-                "
-            }
-            script {
-                (include_str!("htmx_ticker.js"))
-            }
-        }
-        body {
+    Ok(layout! {
+        html! {
             div class="container mb-5" {
                 section class="section" {
                     a href="/conversations/" {
@@ -481,7 +469,7 @@ async fn conversations_show(
                     div {
                         select
                             name="model-id"
-                            hx-post=(format!("/models/select/{}", conversation.id))
+                            hx-put=(format!("/models/select/{}", conversation.id))
                             hx-swap="none"
                         {
                             @for model in models.iter() {
@@ -1231,7 +1219,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/messages/new", post(messages_create))
         .route("/messages/response/sse", get(messages_create_sse_handler))
         .route("/empty", get(|| async {}))
-        .route("/models/select/{conversation_id}", post(select_model))
+        .route("/models/select/{conversation_id}", put(select_model))
         .route(
             "/dev/state",
             get(|State(state): State<Arc<Mutex<AppState>>>| async move {
